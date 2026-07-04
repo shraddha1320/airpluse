@@ -1,17 +1,18 @@
+import  'airi_assistant.dart';
 import 'dart:ui';
 import 'package:flutter/material.dart';
+import 'login_screen.dart'; // To reuse AiriGraphicPainter
 class RegisterScreen extends StatefulWidget {
   const RegisterScreen({super.key});
   @override
   State<RegisterScreen> createState() => _RegisterScreenState();
 }
 class _RegisterScreenState extends State<RegisterScreen> with TickerProviderStateMixin {
-  late final AnimationController _animController;
   late final AnimationController _scanController;
+  late final AnimationController _airiController;
   late final PageController _pageController = PageController();
-  late final Animation<double> _fade;
-  late final Animation<Offset> _slide;
   late final Animation<double> _scanLine;
+  late final Animation<double> _airiFloat;
   final _formKey1 = GlobalKey<FormState>();
   final _formKey2 = GlobalKey<FormState>();
   final _nameController = TextEditingController();
@@ -28,18 +29,15 @@ class _RegisterScreenState extends State<RegisterScreen> with TickerProviderStat
   @override
   void initState() {
     super.initState();
-    _animController = AnimationController(vsync: this, duration: const Duration(milliseconds: 1000));
-    _fade = CurvedAnimation(parent: _animController, curve: Curves.easeOut);
-    _slide = Tween<Offset>(begin: const Offset(0.0, 0.05), end: Offset.zero)
-        .animate(CurvedAnimation(parent: _animController, curve: Curves.easeOutCubic));
     _scanController = AnimationController(vsync: this, duration: const Duration(seconds: 4))..repeat();
     _scanLine = Tween<double>(begin: 0.0, end: 1.0).animate(_scanController);
-    _animController.forward();
+    _airiController = AnimationController(vsync: this, duration: const Duration(seconds: 2))..repeat(reverse: true);
+    _airiFloat = Tween<double>(begin: 0.0, end: 5.0).animate(CurvedAnimation(parent: _airiController, curve: Curves.easeInOut));
   }
   @override
   void dispose() {
-    _animController.dispose();
     _scanController.dispose();
+    _airiController.dispose();
     _pageController.dispose();
     _nameController.dispose();
     _emailController.dispose();
@@ -49,9 +47,15 @@ class _RegisterScreenState extends State<RegisterScreen> with TickerProviderStat
     _otpController.dispose();
     super.dispose();
   }
+  String _getAiriMessage() {
+    if (_isSuccess) return "Welcome to AirPulse AI!";
+    return _currentPage == 0
+        ? "Let's build a cleaner Mumbai together."
+        : "Your account helps us maintain trusted reports.";
+  }
   void _nextPage() {
     if (_formKey1.currentState!.validate()) {
-      _pageController.nextPage(duration: const Duration(milliseconds: 400), curve: Curves.easeInOut);
+      _pageController.nextPage(duration: const Duration(milliseconds: 300), curve: Curves.easeInOut);
       setState(() => _currentPage = 1);
     }
   }
@@ -59,7 +63,6 @@ class _RegisterScreenState extends State<RegisterScreen> with TickerProviderStat
     if (!_formKey2.currentState!.validate()) return;
     setState(() => _isLoading = true);
     try {
-      // TODO: Firebase/Firestore Auth & Creation Logic
       await Future.delayed(const Duration(seconds: 1));
       setState(() => _isSuccess = true);
     } catch (e) {
@@ -79,17 +82,11 @@ class _RegisterScreenState extends State<RegisterScreen> with TickerProviderStat
           Positioned.fill(child: Container(decoration: const BoxDecoration(gradient: LinearGradient(colors: [Color(0xFFEEF7F4), Color(0xFFF5FBFF), Color(0xFFEAF4FF)])))),
           Positioned.fill(child: AnimatedBuilder(animation: _scanLine, builder: (c, w) => CustomPaint(painter: _MumbaiMapPainter(scanValue: _scanLine.value)))),
           SafeArea(
-            child: FadeTransition(
-              opacity: _fade,
-              child: SlideTransition(
-                position: _slide,
-                child: Center(
-                  child: SingleChildScrollView(
-                    physics: const BouncingScrollPhysics(),
-                    padding: EdgeInsets.symmetric(horizontal: isTablet ? size.width * 0.15 : 20.0, vertical: 16.0),
-                    child: _isSuccess ? _buildSuccessView() : _buildMainRegisterView(isTablet),
-                  ),
-                ),
+            child: Center(
+              child: SingleChildScrollView(
+                physics: const BouncingScrollPhysics(),
+                padding: EdgeInsets.symmetric(horizontal: isTablet ? size.width * 0.15 : 20.0, vertical: 16.0),
+                child: _isSuccess ? _buildSuccessView() : _buildMainRegisterView(isTablet),
               ),
             ),
           ),
@@ -100,7 +97,6 @@ class _RegisterScreenState extends State<RegisterScreen> with TickerProviderStat
   Widget _buildMainRegisterView(bool isTablet) {
     return Column(
       children: [
-        // App Branding Header
         const Row(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
@@ -108,8 +104,10 @@ class _RegisterScreenState extends State<RegisterScreen> with TickerProviderStat
             Text('AI', style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Color(0xFF10B981))),
           ],
         ),
+        const SizedBox(height: 12),
+        // Inline Airi Guide Card
+        _buildInlineAiriCard(),
         const SizedBox(height: 16),
-        // Progress bar step indicator
         Column(
           children: [
             Text('Step ${_currentPage + 1} of 2', style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF0EA5E9), fontSize: 13)),
@@ -124,8 +122,7 @@ class _RegisterScreenState extends State<RegisterScreen> with TickerProviderStat
             ),
           ],
         ),
-        const SizedBox(height: 24),
-        // Multi-Step PageView inside Container Card
+        const SizedBox(height: 16),
         Container(
           height: 380,
           padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 10.0),
@@ -138,35 +135,59 @@ class _RegisterScreenState extends State<RegisterScreen> with TickerProviderStat
           child: PageView(
             controller: _pageController,
             physics: const NeverScrollableScrollPhysics(),
-            children: [
-              _buildPageOne(),
-              _buildPageTwo(isTablet),
-            ],
+            children: [_buildPageOne(), _buildPageTwo(isTablet)],
           ),
         ),
         const SizedBox(height: 16),
-        // Back to sign in link
         Row(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
             Text('Already have an account? ', style: TextStyle(color: Colors.black.withOpacity(0.6))),
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(),
-              child: const Text('Sign In', style: TextStyle(color: Color(0xFF10B981), fontWeight: FontWeight.bold)),
-            ),
-          ],
-        ),
-        const SizedBox(height: 16),
-        // Badges
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-          children: [
-            _badge('🔒 Secure'),
-            _badge('🤖 AI Powered'),
-            _badge('🛰 Live Satellite'),
+            TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('Sign In', style: TextStyle(color: Color(0xFF10B981), fontWeight: FontWeight.bold))),
           ],
         ),
       ],
+    );
+  }
+  Widget _buildInlineAiriCard() {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.9),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: const Color(0xFFE2E8F0)),
+      ),
+      child: Row(
+        children: [
+          AnimatedBuilder(
+            animation: _airiFloat,
+            builder: (context, child) {
+              return Transform.translate(
+                offset: Offset(0, _airiFloat.value),
+                child: SizedBox(
+                  width: 40,
+                  height: 40,
+                  child: CustomPaint(painter: AiriCharacterPainter(expression: 'excited')),
+                ),
+              );
+            },
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('Airi • Onboarding Assistant', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 10.5, color: Color(0xFF0EA5E9))),
+                const SizedBox(height: 2),
+                Text(
+                  _getAiriMessage(),
+                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12.5, color: Color(0xFF0F172A)),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
     );
   }
   Widget _buildPageOne() {
@@ -258,9 +279,9 @@ class _RegisterScreenState extends State<RegisterScreen> with TickerProviderStat
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          const Icon(Icons.check_circle_outline_rounded, color: Color(0xFF10B981), size: 72),
+          const Icon(Icons.check_circle_outline, color: Color(0xFF10B981), size: 64),
           const SizedBox(height: 16),
-          const Text('Account Created Successfully', textAlign: TextAlign.center, style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Color(0xFF0F172A))),
+          const Text('Account Created Successfully', textAlign: TextAlign.center, style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Color(0xFF0F172A))),
           const SizedBox(height: 4),
           const Text('Welcome to AirPulse AI', style: TextStyle(color: Colors.black54)),
           const SizedBox(height: 24),
@@ -275,13 +296,6 @@ class _RegisterScreenState extends State<RegisterScreen> with TickerProviderStat
           ),
         ],
       ),
-    );
-  }
-  Widget _badge(String txt) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20), border: Border.all(color: const Color(0xFFE2E8F0))),
-      child: Text(txt, style: const TextStyle(color: Colors.black54, fontSize: 10.5, fontWeight: FontWeight.bold)),
     );
   }
   Widget _buildField(TextEditingController ctrl, String label, String hint, IconData icon, {bool obscure = false, Widget? suffix, TextInputType? type, String? Function(String?)? validator}) {
@@ -309,28 +323,15 @@ class _MumbaiMapPainter extends CustomPainter {
   _MumbaiMapPainter({required this.scanValue});
   @override
   void paint(Canvas canvas, Size size) {
-    final w = size.width;
-    final h = size.height;
+    final w = size.width, h = size.height;
     final roadPaint = Paint()..color = Colors.black.withOpacity(0.02)..strokeWidth = 0.5..style = PaintingStyle.stroke;
-    for (double i = 0; i < h; i += 90) {
-      canvas.drawLine(Offset(0, i), Offset(w, i + 20), roadPaint);
-    }
-    for (double i = 0; i < w; i += 80) {
-      canvas.drawLine(Offset(i, 0), Offset(i + 30, h), roadPaint);
-    }
-    final green = Paint()..color = const Color(0xFF10B981).withOpacity(0.04)..style = PaintingStyle.fill..maskFilter = const MaskFilter.blur(BlurStyle.normal, 20);
-    final yellow = Paint()..color = const Color(0xFFF59E0B).withOpacity(0.05)..style = PaintingStyle.fill..maskFilter = const MaskFilter.blur(BlurStyle.normal, 30);
-    final red = Paint()..color = const Color(0xFFEF4444).withOpacity(0.05)..style = PaintingStyle.fill..maskFilter = const MaskFilter.blur(BlurStyle.normal, 35);
-    canvas.drawCircle(Offset(w * 0.2, h * 0.3), 50, green);
-    canvas.drawCircle(Offset(w * 0.8, h * 0.15), 70, yellow);
-    canvas.drawCircle(Offset(w * 0.45, h * 0.6), 80, red);
+    for (double i = 0; i < h; i += 90) canvas.drawLine(Offset(0, i), Offset(w, i + 20), roadPaint);
+    for (double i = 0; i < w; i += 80) canvas.drawLine(Offset(i, 0), Offset(i + 30, h), roadPaint);
+    canvas.drawCircle(Offset(w * 0.2, h * 0.3), 50, Paint()..color = const Color(0xFF10B981).withOpacity(0.04)..style = PaintingStyle.fill..maskFilter = const MaskFilter.blur(BlurStyle.normal, 20));
+    canvas.drawCircle(Offset(w * 0.8, h * 0.15), 70, Paint()..color = const Color(0xFFF59E0B).withOpacity(0.05)..style = PaintingStyle.fill..maskFilter = const MaskFilter.blur(BlurStyle.normal, 30));
+    canvas.drawCircle(Offset(w * 0.45, h * 0.6), 80, Paint()..color = const Color(0xFFEF4444).withOpacity(0.05)..style = PaintingStyle.fill..maskFilter = const MaskFilter.blur(BlurStyle.normal, 35));
     final sweep = Paint()
-      ..shader = LinearGradient(
-        begin: Alignment.topCenter,
-        end: Alignment.bottomCenter,
-        colors: [const Color(0xFF10B981).withOpacity(0.0), const Color(0xFF10B981).withOpacity(0.1), const Color(0xFF10B981).withOpacity(0.0)],
-      ).createShader(Rect.fromLTWH(0, h * scanValue - 40, w, 80))
-      ..style = PaintingStyle.fill;
+      ..shader = LinearGradient(begin: Alignment.topCenter, end: Alignment.bottomCenter, colors: [const Color(0xFF10B981).withOpacity(0.0), const Color(0xFF10B981).withOpacity(0.1), const Color(0xFF10B981).withOpacity(0.0)]).createShader(Rect.fromLTWH(0, h * scanValue - 40, w, 80))..style = PaintingStyle.fill;
     canvas.drawRect(Rect.fromLTWH(0, h * scanValue - 40, w, 80), sweep);
   }
   @override
