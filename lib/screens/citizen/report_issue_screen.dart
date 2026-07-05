@@ -1,7 +1,13 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math' as math;
 import 'dart:ui';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:geocoding/geocoding.dart';
 import 'airi_assistant.dart';
 class ReportIssueScreen extends StatefulWidget {
   final bool isGuest;
@@ -14,7 +20,7 @@ class ReportIssueScreen extends StatefulWidget {
   @override
   State<ReportIssueScreen> createState() => _ReportIssueScreenState();
 }
-class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProviderStateMixin {
+class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProviderStateMixin, WidgetsBindingObserver {
   // Animation controllers
   late final AnimationController _scanController;
   late final AnimationController _loopController;
@@ -24,42 +30,48 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
   // Validation keys
   final _formKey1 = GlobalKey<FormState>();
   final _formKey3 = GlobalKey<FormState>();
-  // Preserved controllers
+  // Input Controllers
   final _descCtrl = TextEditingController();
+  final _stateCtrl = TextEditingController();
+  final _cityCtrl = TextEditingController();
+  final _areaCtrl = TextEditingController();
   final _landmarkCtrl = TextEditingController();
-  final _remarksCtrl = TextEditingController();
   // State variables
   int _step = 0;
   String? _category;
-  String? _imageSource;
+  final ImagePicker _imagePicker = ImagePicker();
+  File? _capturedImage;
+  bool _isImageConfirmed = false;
   bool _isSubmitting = false;
   bool _isSuccess = false;
+  // Permission states
+  bool _cameraPermissionGranted = false;
+  bool _locationPermissionGranted = false;
+  // Tracks which permission the user was sent to Settings for, so it can
+  // be re-checked automatically when the app resumes.
+  String? _pendingSettingsPermission;
   // AI Scan state variables
   bool _isAiScanning = false;
   double _aiScanProgress = 0.0;
   String _aiScanText = "Initializing scan...";
   Timer? _aiScanTimer;
-  // Additional Step 3 States
-  String _urgencyLevel = 'Medium';
-  late bool _anonymousReporting;
   bool _isSatelliteLayer = true;
-  // Categories list
-  final List<Map<String, String>> _categories = [
-    {"label": "Smoke", "icon": "🔥", "desc": "Airborne smoke plumes or fires"},
-    {"label": "Garbage Burning", "icon": "🗑", "desc": "Incineration of urban solid wastes"},
-    {"label": "Industrial Emissions", "icon": "🏭", "desc": "Toxic chemical chimney smoke"},
-    {"label": "Construction Dust", "icon": "🚧", "desc": "Uncontrolled dust particles from construction"},
-    {"label": "Vehicle Pollution", "icon": "🚗", "desc": "Heavy tailpipe vehicle exhaust"},
-    {"label": "Chemical Leak", "icon": "☣", "desc": "Liquid or gaseous spill incident"},
-    {"label": "Water Pollution", "icon": "💧", "desc": "Toxic effluents in water bodies"},
-    {"label": "Noise Pollution", "icon": "🔊", "desc": "Sustained high-level urban noises"},
-    {"label": "Illegal Dumping", "icon": "🚜", "desc": "Unauthorized waste trash disposal"},
+  // Dropdown categories options
+  final List<String> _categories = [
+    'Smoke Pollution',
+    'Garbage Burning',
+    'Industrial Emissions',
+    'Dust Pollution',
+    'Construction Pollution',
+    'Vehicle Smoke',
+    'Illegal Waste Burning',
+    'Other'
   ];
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _pageController = PageController(initialPage: 0);
-    _anonymousReporting = widget.isGuest;
     _scanController = AnimationController(
       vsync: this,
       duration: const Duration(seconds: 4),
@@ -76,15 +88,31 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
   }
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _scanController.dispose();
     _loopController.dispose();
     _aiScanController.dispose();
     _pageController.dispose();
     _descCtrl.dispose();
+    _stateCtrl.dispose();
+    _cityCtrl.dispose();
+    _areaCtrl.dispose();
     _landmarkCtrl.dispose();
-    _remarksCtrl.dispose();
     _aiScanTimer?.cancel();
     super.dispose();
+  }
+  // Re-check pending permission when the user returns from device Settings.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && _pendingSettingsPermission != null) {
+      final String pending = _pendingSettingsPermission!;
+      _pendingSettingsPermission = null;
+      if (pending == 'camera') {
+        _recheckCameraPermission();
+      } else if (pending == 'location') {
+        _recheckLocationPermission();
+      }
+    }
   }
   String _getAiriMessage() {
     if (_isSuccess) return "Report uploaded to the satellite mesh grid!";
@@ -98,8 +126,10 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
       }
     }
     if (_step == 1) {
-      if (_imageSource == null) {
-        return "Please capture or upload a photo of the incident.";
+      if (_capturedImage == null) {
+        return "Please capture a live photo to confirm atmospheric data.";
+      } else if (!_isImageConfirmed) {
+        return "Confirm if this image represents the incident accurately.";
       } else {
         return "Evidence verify complete! This looks severe.";
       }
@@ -108,8 +138,8 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
   }
   String _getAiriExpression() {
     if (_isSuccess) return "happy";
-    if (_isAiScanning) return "sleeping"; // Scanning posture
-    if (_step == 1 && _imageSource != null) return "happy";
+    if (_isAiScanning) return "sleeping";
+    if (_step == 1 && _capturedImage != null) return "happy";
     if (_step == 2) return "monitoring";
     return "excited";
   }
@@ -125,9 +155,9 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
         return;
       }
     }
-    if (_step == 1 && _imageSource == null) {
+    if (_step == 1 && (_capturedImage == null || !_isImageConfirmed)) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please upload evidence for AI analysis')),
+        const SnackBar(content: Text('Please capture and confirm the photo evidence first.')),
       );
       return;
     }
@@ -140,6 +170,10 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
         duration: const Duration(milliseconds: 400),
         curve: Curves.easeInOut,
       );
+      // Auto-trigger location permission and fetch location when entering step 3
+      if (_step == 2) {
+        _requestLocationPermission();
+      }
     }
   }
   void _previous() {
@@ -156,10 +190,200 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
       Navigator.pop(context);
     }
   }
+  // ------------------------------------------------------------------
+  // REAL CAMERA PERMISSION + CAPTURE (image_picker + permission_handler)
+  // ------------------------------------------------------------------
+  Future<void> _requestCameraPermission() async {
+    final PermissionStatus status = await Permission.camera.request();
+    if (status.isGranted) {
+      setState(() {
+        _cameraPermissionGranted = true;
+      });
+      _openCamera();
+    } else {
+      _showCameraPermissionRequiredDialog();
+    }
+  }
+  Future<void> _recheckCameraPermission() async {
+    final PermissionStatus status = await Permission.camera.status;
+    if (status.isGranted) {
+      setState(() {
+        _cameraPermissionGranted = true;
+      });
+      _openCamera();
+    }
+  }
+  void _showCameraPermissionRequiredDialog() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF1B1D22),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: const Row(
+          children: [
+            Icon(Icons.warning_amber_rounded, color: Color(0xFFFFC72C)),
+            SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                'Camera Permission Required',
+                style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ],
+        ),
+        content: const Text(
+          'Camera permission is required to report pollution incidents.',
+          style: TextStyle(color: Colors.white70, fontSize: 13),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel', style: TextStyle(color: Colors.white38)),
+          ),
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              _pendingSettingsPermission = 'camera';
+              openAppSettings();
+            },
+            child: const Text('Open Settings', style: TextStyle(color: Color(0xFFFFC72C))),
+          ),
+        ],
+      ),
+    );
+  }
+  Future<void> _openCamera() async {
+    try {
+      final XFile? photo = await _imagePicker.pickImage(
+        source: ImageSource.camera,
+        preferredCameraDevice: CameraDevice.rear,
+        imageQuality: 85,
+      );
+      if (photo != null) {
+        setState(() {
+          _capturedImage = File(photo.path);
+          _isImageConfirmed = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Unable to access the camera. Please try again.')),
+        );
+      }
+    }
+  }
+  // ------------------------------------------------------------------
+  // REAL LOCATION PERMISSION + GPS + REVERSE GEOCODING
+  // (geolocator + geocoding)
+  // ------------------------------------------------------------------
+  Future<void> _requestLocationPermission() async {
+    final bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) {
+      _showLocationPermissionRequiredDialog(serviceDisabled: true);
+      return;
+    }
+    LocationPermission permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+    }
+    if (permission == LocationPermission.whileInUse ||
+        permission == LocationPermission.always) {
+      setState(() {
+        _locationPermissionGranted = true;
+      });
+      _fetchLocationCoordinates();
+    } else {
+      _showLocationPermissionRequiredDialog(serviceDisabled: false);
+    }
+  }
+  Future<void> _recheckLocationPermission() async {
+    final LocationPermission permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.whileInUse ||
+        permission == LocationPermission.always) {
+      setState(() {
+        _locationPermissionGranted = true;
+      });
+      _fetchLocationCoordinates();
+    }
+  }
+  void _showLocationPermissionRequiredDialog({required bool serviceDisabled}) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF1B1D22),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: const Row(
+          children: [
+            Icon(Icons.location_off_rounded, color: Color(0xFFEF4444)),
+            SizedBox(width: 10),
+            Expanded(
+              child: Text('Location Permission', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+            ),
+          ],
+        ),
+        content: const Text(
+          'Location permission is required to register a complaint.',
+          style: TextStyle(color: Colors.white70, fontSize: 13),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              // Denied: Return user back to Home Screen
+              Navigator.pop(context);
+            },
+            child: const Text('Cancel', style: TextStyle(color: Colors.white38)),
+          ),
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              _pendingSettingsPermission = 'location';
+              if (serviceDisabled) {
+                Geolocator.openLocationSettings();
+              } else {
+                Geolocator.openAppSettings();
+              }
+            },
+            child: const Text('Open Settings', style: TextStyle(color: Color(0xFFFFC72C))),
+          ),
+        ],
+      ),
+    );
+  }
+  Future<void> _fetchLocationCoordinates() async {
+    try {
+      final Position position = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+      );
+      final List<Placemark> placemarks = await placemarkFromCoordinates(
+        position.latitude,
+        position.longitude,
+      );
+      if (placemarks.isNotEmpty) {
+        final Placemark place = placemarks.first;
+        setState(() {
+          _stateCtrl.text = place.administrativeArea ?? '';
+          _cityCtrl.text = place.locality?.isNotEmpty == true
+              ? place.locality!
+              : (place.subAdministrativeArea ?? '');
+          _areaCtrl.text = place.subLocality?.isNotEmpty == true
+              ? place.subLocality!
+              : (place.street ?? '');
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Unable to fetch current location. Please try again.')),
+        );
+      }
+    }
+  }
   // AI Scanning Simulator Flow
-  void _triggerAiScan(String source) {
+  void _triggerAiScan() {
     setState(() {
-      _imageSource = source;
+      _isImageConfirmed = true;
       _isAiScanning = true;
       _aiScanProgress = 0.0;
     });
@@ -172,7 +396,7 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
       "Verifying confidence bounds..."
     ];
     int currentStep = 0;
-    _aiScanTimer = Timer.periodic(const Duration(milliseconds: 500), (timer) {
+    _aiScanTimer = Timer.periodic(const Duration(milliseconds: 400), (timer) {
       if (!mounted) {
         timer.cancel();
         return;
@@ -186,15 +410,13 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
         if (_aiScanProgress >= 1.0) {
           _isAiScanning = false;
           timer.cancel();
+          _next(); // Proceed automatically after scan
         }
       });
     });
   }
-  // Preserved original submit flow
   void _submit() async {
-    if (!_formKey3.currentState!.validate()) {
-      return;
-    }
+    if (!_formKey3.currentState!.validate()) return;
     setState(() {
       _isSubmitting = true;
     });
@@ -221,26 +443,13 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
           onPressed: _previous,
         ),
         title: const Text(
-          'AI Incident Reporting',
+          'Report Pollution Incident',
           style: TextStyle(fontWeight: FontWeight.w900, color: Colors.white),
         ),
-        actions: [
-          IconButton(
-            icon: Icon(
-              _isSatelliteLayer ? Icons.satellite_outlined : Icons.map_outlined,
-              color: const Color(0xFF38BDF8),
-            ),
-            onPressed: () {
-              setState(() {
-                _isSatelliteLayer = !_isSatelliteLayer;
-              });
-            },
-          ),
-        ],
       ),
       body: Stack(
         children: [
-          // 1. Live Animated Satellite Grid Background
+          // 1. Satellite background scan grid lines
           Positioned.fill(
             child: AnimatedBuilder(
               animation: _loopController,
@@ -254,22 +463,19 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
               },
             ),
           ),
-          // 2. Responsive UI Page Flow
+          // 2. Main Page Layout PageView
           SafeArea(
             child: Center(
               child: _isSuccess
                   ? _buildSuccessScreen(size, isTablet)
                   : Column(
                 children: [
-                  // Animated progress indicator header
                   _buildStepHeaderIndicator(),
-                  // Embedded AIRI assistant feedback
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 20.0, vertical: 8.0),
                     child: _buildAiriCardSection(),
                   ),
                   const SizedBox(height: 12),
-                  // Form contents
                   Expanded(
                     child: PageView(
                       controller: _pageController,
@@ -290,7 +496,7 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
     );
   }
   Widget _buildStepHeaderIndicator() {
-    final List<String> steps = ['Detect', 'Verify', 'Submit'];
+    final List<String> steps = ['Details', 'Evidence', 'Submit'];
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 12.0),
       child: Column(
@@ -312,9 +518,6 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
                         color: isCurrent ? const Color(0xFFFFC72C) : Colors.white.withOpacity(0.05),
                         width: 1.5,
                       ),
-                      boxShadow: isCurrent
-                          ? [BoxShadow(color: const Color(0xFFFFC72C).withOpacity(0.25), blurRadius: 10)]
-                          : null,
                     ),
                     child: Row(
                       children: [
@@ -354,7 +557,7 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
             child: LinearProgressIndicator(
               value: (_step + 1) / 3,
               minHeight: 3,
-              backgroundColor: Colors.white,
+              backgroundColor: Colors.white10,
               valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFFFFC72C)),
             ),
           ),
@@ -369,13 +572,6 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
         color: const Color(0xFF1B1D22).withOpacity(0.85),
         borderRadius: BorderRadius.circular(22),
         border: Border.all(color: Colors.white.withOpacity(0.08)),
-        boxShadow: const [
-          BoxShadow(
-            color: Colors.black26,
-            blurRadius: 8,
-            offset: Offset(0, 4),
-          ),
-        ],
       ),
       child: Row(
         children: [
@@ -384,9 +580,7 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
             height: 44,
             child: ClipOval(
               child: CustomPaint(
-                painter: AiriCharacterPainter(
-                  expression: _getAiriExpression(),
-                ),
+                painter: AiriCharacterPainter(expression: _getAiriExpression()),
               ),
             ),
           ),
@@ -397,12 +591,7 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
               children: [
                 const Text(
                   "AIRI • FIELD INTELLIGENCE",
-                  style: TextStyle(
-                    fontSize: 9,
-                    fontWeight: FontWeight.bold,
-                    color: Color(0xFF38BDF8),
-                    letterSpacing: 0.5,
-                  ),
+                  style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: Color(0xFF38BDF8), letterSpacing: 0.5),
                 ),
                 const SizedBox(height: 3),
                 AnimatedSwitcher(
@@ -410,11 +599,7 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
                   child: Text(
                     _getAiriMessage(),
                     key: ValueKey<String>(_getAiriMessage()),
-                    style: const TextStyle(
-                      fontSize: 12.5,
-                      color: Colors.white70,
-                      fontWeight: FontWeight.w500,
-                    ),
+                    style: const TextStyle(fontSize: 12.5, color: Colors.white70, fontWeight: FontWeight.w500),
                   ),
                 ),
               ],
@@ -424,7 +609,7 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
       ),
     );
   }
-  // STEPS CONTENT BUILDERS
+  // STEP WIDGETS BUILDERS
   Widget _buildStep1Category(bool isTablet) {
     return SingleChildScrollView(
       physics: const BouncingScrollPhysics(),
@@ -435,106 +620,75 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
-              "Select Pollution Category",
-              style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white60),
+              "Complaint Category",
+              style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white60),
             ),
-            const SizedBox(height: 12),
-            // Responsive Category Cards Grid
-            GridView.builder(
-              shrinkWrap: true,
-              physics: const NeverScrollableScrollPhysics(),
-              itemCount: _categories.length,
-              gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                crossAxisCount: isTablet ? 3 : 2,
-                crossAxisSpacing: 12,
-                mainAxisSpacing: 12,
-                childAspectRatio: 1.25,
+            const SizedBox(height: 10),
+            // Dropdown selection (Replacing multi-grid cards)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
+              decoration: BoxDecoration(
+                color: const Color(0xFF1B1D22),
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: Colors.white10),
               ),
-              itemBuilder: (context, index) {
-                final cat = _categories[index];
-                final bool isSelected = _category == cat["label"];
-
-                return GestureDetector(
-                  onTap: () {
+              child: DropdownButtonHideUnderline(
+                child: DropdownButton<String>(
+                  isExpanded: true,
+                  hint: const Text('Select category...', style: TextStyle(color: Colors.white24, fontSize: 13)),
+                  dropdownColor: const Color(0xFF1B1D22),
+                  value: _category,
+                  items: _categories.map((String val) {
+                    return DropdownMenuItem<String>(
+                      value: val,
+                      child: Text(val, style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold)),
+                    );
+                  }).toList(),
+                  onChanged: (newValue) {
                     setState(() {
-                      _category = cat["label"];
+                      _category = newValue;
                     });
                   },
-                  child: AnimatedContainer(
-                    duration: const Duration(milliseconds: 250),
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: isSelected
-                          ? const Color(0xFFFFC72C).withOpacity(0.12)
-                          : const Color(0xFF1B1D22),
-                      borderRadius: BorderRadius.circular(20),
-                      border: Border.all(
-                        color: isSelected ? const Color(0xFFFFC72C) : Colors.white.withOpacity(0.06),
-                        width: 1.5,
-                      ),
-                      boxShadow: isSelected
-                          ? [BoxShadow(color: const Color(0xFFFFC72C).withOpacity(0.2), blurRadius: 10)]
-                          : null,
-                    ),
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      crossAxisAlignment: CrossAxisAlignment.center,
-                      children: [
-                        Text(
-                          cat["icon"]!,
-                          style: const TextStyle(fontSize: 26),
-                        ),
-                        const SizedBox(height: 8),
-                        Text(
-                          cat["label"]!,
-                          textAlign: TextAlign.center,
-                          style: TextStyle(
-                            fontSize: 12,
-                            fontWeight: FontWeight.bold,
-                            color: isSelected ? const Color(0xFFFFC72C) : Colors.white,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                );
-              },
+                ),
+              ),
             ),
-            const SizedBox(height: 20),
-            // Incident Description
+            const SizedBox(height: 24),
             const Text(
-              "Describe Incident Circumstances",
-              style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white60),
+              "Description",
+              style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white60),
             ),
             const SizedBox(height: 10),
             TextFormField(
               controller: _descCtrl,
-              maxLength: 300,
+              maxLength: 500,
               maxLines: 4,
               style: const TextStyle(color: Colors.white, fontSize: 13),
-              decoration: _decInput('Enter details about size, behavior, duration...'),
+              decoration: _decInput('Describe the issue in detail...'),
+              onChanged: (_) => setState(() {}),
               validator: (v) {
                 if (v == null || v.isEmpty) return 'Incident description is required';
                 return null;
               },
             ),
-            const SizedBox(height: 20),
-            // Continue action
+            const SizedBox(height: 24),
+            // Continue action button
             SizedBox(
               width: double.infinity,
               height: 52,
               child: ElevatedButton(
-                onPressed: _next,
+                onPressed: (_category != null && _descCtrl.text.isNotEmpty) ? _next : null,
                 style: ElevatedButton.styleFrom(
                   backgroundColor: const Color(0xFFFFC72C),
                   foregroundColor: const Color(0xFF111315),
+                  disabledBackgroundColor: Colors.white10,
+                  disabledForegroundColor: Colors.white24,
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
                   elevation: 4,
                 ),
                 child: const Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    Text("Continue verification", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                    Text("Continue", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
                     SizedBox(width: 8),
                     Icon(Icons.arrow_forward_rounded, size: 18),
                   ],
@@ -552,7 +706,6 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
       padding: const EdgeInsets.symmetric(horizontal: 20.0, vertical: 10.0),
       child: Column(
         children: [
-          // Simulated Camera View finder with AI Overlay scan lines
           Expanded(
             child: Container(
               width: double.infinity,
@@ -564,7 +717,7 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
               child: Stack(
                 alignment: Alignment.center,
                 children: [
-                  if (_imageSource == null) ...[
+                  if (_capturedImage == null) ...[
                     // Empty viewfinder state
                     Column(
                       mainAxisAlignment: MainAxisAlignment.center,
@@ -575,25 +728,74 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
                             shape: BoxShape.circle,
                             color: Colors.white.withOpacity(0.02),
                           ),
-                          child: const Icon(Icons.cloud_upload_outlined, size: 48, color: Colors.white30),
+                          child: const Icon(Icons.photo_camera, size: 48, color: Colors.white30),
                         ),
                         const SizedBox(height: 12),
                         const Text(
-                          "Awaiting Evidence Source Capture",
+                          "Awaiting Camera Capture",
                           style: TextStyle(color: Colors.white70, fontWeight: FontWeight.bold),
-                        ),
-                        const SizedBox(height: 4),
-                        const Text(
-                          "Support drag & drop files on desktop",
-                          style: TextStyle(color: Colors.white24, fontSize: 11),
                         ),
                       ],
                     ),
+                  ] else if (_capturedImage != null && !_isImageConfirmed) ...[
+                    // Image Preview Screen before continuing (real captured image)
+                    Padding(
+                      padding: const EdgeInsets.all(20.0),
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(16),
+                            child: Image.file(
+                              _capturedImage!,
+                              height: 140,
+                              width: 140,
+                              fit: BoxFit.cover,
+                            ),
+                          ),
+                          const SizedBox(height: 14),
+                          const Text(
+                            "Captured Evidence Preview",
+                            style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 14),
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            "${_capturedImage!.path.split('/').last} (Captured Successfully)",
+                            style: const TextStyle(color: Colors.white38, fontSize: 11),
+                          ),
+                          const SizedBox(height: 24),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: OutlinedButton(
+                                  onPressed: () => setState(() => _capturedImage = null),
+                                  style: OutlinedButton.styleFrom(
+                                    side: const BorderSide(color: Color(0xFFEF4444)),
+                                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                                  ),
+                                  child: const Text("Retake Photo", style: TextStyle(color: Color(0xFFEF4444))),
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: ElevatedButton(
+                                  onPressed: _triggerAiScan,
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: const Color(0xFFFFC72C),
+                                    foregroundColor: const Color(0xFF111315),
+                                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                                  ),
+                                  child: const Text("Continue"),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
                   ] else if (_isAiScanning) ...[
-                    // Scanning State Animation
                     _buildScanAnimationView(),
                   ] else ...[
-                    // Post-Scan Verification Screen
                     _buildScanResultView(),
                   ],
                 ],
@@ -601,57 +803,37 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
             ),
           ),
           const SizedBox(height: 16),
-          // Upload Selection Buttons
-          Row(
-            children: [
-              Expanded(
-                child: SizedBox(
-                  height: 48,
-                  child: OutlinedButton.icon(
-                    onPressed: () => _triggerAiScan('Camera'),
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: Colors.white,
-                      side: BorderSide(color: Colors.white.withOpacity(0.1)),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-                    ),
-                    icon: const Icon(Icons.photo_camera_outlined, size: 18),
-                    label: const Text('Capture Camera', style: TextStyle(fontWeight: FontWeight.bold)),
-                  ),
+          // Upload Selection Buttons (Camera capture only, gallery removed)
+          if (_capturedImage == null)
+            SizedBox(
+              width: double.infinity,
+              height: 50,
+              child: OutlinedButton.icon(
+                onPressed: _cameraPermissionGranted ? _openCamera : _requestCameraPermission,
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: const Color(0xFFFFC72C),
+                  side: const BorderSide(color: Color(0xFFFFC72C), width: 1.2),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
                 ),
+                icon: const Icon(Icons.photo_camera, size: 18),
+                label: const Text('Take a Photo', style: TextStyle(fontWeight: FontWeight.bold)),
               ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: SizedBox(
-                  height: 48,
-                  child: OutlinedButton.icon(
-                    onPressed: () => _triggerAiScan('Gallery'),
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: Colors.white,
-                      side: BorderSide(color: Colors.white.withOpacity(0.1)),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-                    ),
-                    icon: const Icon(Icons.photo_library_outlined, size: 18),
-                    label: const Text('Upload Gallery', style: TextStyle(fontWeight: FontWeight.bold)),
-                  ),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 16),
-          // Next navigation trigger
-          SizedBox(
-            width: double.infinity,
-            height: 50,
-            child: ElevatedButton(
-              onPressed: (_imageSource != null && !_isAiScanning) ? _next : null,
-              style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFFFFC72C),
-                foregroundColor: const Color(0xFF111315),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-              ),
-              child: const Text('Proceed to Location validation', style: TextStyle(fontWeight: FontWeight.bold)),
             ),
-          ),
+          const SizedBox(height: 16),
+          if (_capturedImage != null && _isImageConfirmed && !_isAiScanning)
+            SizedBox(
+              width: double.infinity,
+              height: 50,
+              child: ElevatedButton(
+                onPressed: _next,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFFFFC72C),
+                  foregroundColor: const Color(0xFF111315),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                ),
+                child: const Text('Proceed to Address Verification', style: TextStyle(fontWeight: FontWeight.bold)),
+              ),
+            ),
         ],
       ),
     );
@@ -659,17 +841,15 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
   Widget _buildScanAnimationView() {
     return Stack(
       children: [
-        // AI Grid mesh mockup
         Positioned.fill(
           child: CustomPaint(
             painter: _AiMeshPainter(progress: _aiScanProgress),
           ),
         ),
-        // Scanning Bar Sweep
         AnimatedBuilder(
           animation: _aiScanController,
           builder: (context, child) {
-            final double sweepY = _aiScanProgress * 280; // approximate box boundaries
+            final double sweepY = _aiScanProgress * 280;
             return Positioned(
               top: sweepY,
               left: 0,
@@ -685,7 +865,6 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
             );
           },
         ),
-        // Progress Text Overlay
         Positioned(
           bottom: 24,
           left: 24,
@@ -731,7 +910,6 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
             ),
           ),
           const SizedBox(height: 16),
-          // Metadata metrics
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
             decoration: BoxDecoration(
@@ -744,8 +922,6 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
                 _resultMetricRow("Detected Category", _category ?? "Smoke Plume"),
                 _resultMetricRow("Confidence Score", "96.4% Accuracy"),
                 _resultMetricRow("Severity Index", "Severe Hazard Level"),
-                _resultMetricRow("Estimated AQI Impact", "+42 Units AQI Increase"),
-                _resultMetricRow("Suggested AI Response", "Dispatch Regional Drone Scan"),
               ],
             ),
           ),
@@ -766,6 +942,14 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
     );
   }
   Widget _buildStep3LocationAndSubmit(bool isTablet) {
+    final bool canSubmit = _category != null &&
+        _descCtrl.text.isNotEmpty &&
+        _capturedImage != null &&
+        _cameraPermissionGranted &&
+        _locationPermissionGranted &&
+        _stateCtrl.text.isNotEmpty &&
+        _cityCtrl.text.isNotEmpty &&
+        _areaCtrl.text.isNotEmpty;
     return SingleChildScrollView(
       physics: const BouncingScrollPhysics(),
       padding: const EdgeInsets.symmetric(horizontal: 20.0, vertical: 10.0),
@@ -774,14 +958,14 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // GPS Location Card
+            // GPS Location Card Map Preview
             const Text(
               "Geographic Incident Location",
-              style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white60),
+              style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white60),
             ),
             const SizedBox(height: 10),
             Container(
-              height: 180,
+              height: 140,
               decoration: BoxDecoration(
                 color: const Color(0xFF1B1D22),
                 borderRadius: BorderRadius.circular(20),
@@ -792,17 +976,15 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
                 child: Stack(
                   alignment: Alignment.center,
                   children: [
-                    // Mock Satellite Map lines
                     Positioned.fill(
                       child: CustomPaint(
                         painter: _SatelliteMapPainter(scanValue: _scanLine.value),
                       ),
                     ),
-                    // Center GPS pulsing location marker
                     AnimatedBuilder(
                       animation: _loopController,
                       builder: (context, child) {
-                        final double pulseSize = 14 + 12 * math.sin(_loopController.value * 2 * math.pi * 3);
+                        final double pulseSize = 14 + 10 * math.sin(_loopController.value * 2 * math.pi * 3);
                         return Container(
                           width: pulseSize,
                           height: pulseSize,
@@ -820,77 +1002,36 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
                         );
                       },
                     ),
-                    // GPS Details overlay badge
-                    Positioned(
-                      bottom: 12,
-                      left: 12,
-                      right: 12,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF111315).withOpacity(0.85),
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                        child: const Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                          children: [
-                            Text(
-                              "📍 Mumbai GPS Active",
-                              style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11),
-                            ),
-                            Text(
-                              "18.9750° N, 72.8258° E",
-                              style: TextStyle(color: Colors.white54, fontSize: 10),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
                   ],
                 ),
               ),
             ),
-            const SizedBox(height: 14),
-            Row(
-              children: [
-                Expanded(
-                  child: _buildLocationInputField(
-                    controller: _landmarkCtrl,
-                    label: "Nearby Landmark",
-                    hint: "Gateway of India",
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: _buildLocationInputField(
-                    controller: _remarksCtrl,
-                    label: "Additional Remarks",
-                    hint: "Visible from highway",
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 14),
-            // Urgency selector & Anonymous reporting
-            _buildAdditionalReportSettings(),
             const SizedBox(height: 20),
-            // Incident Review Summary Card (Glassmorphism)
+            // Editable Address Form Fields
             const Text(
-              "AI Incident Summary Review",
-              style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white60),
+              "Detected Address",
+              style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white60),
             ),
             const SizedBox(height: 10),
-            _buildAiIncidentSummaryCard(),
-            const SizedBox(height: 24),
-            // Submit Incident Button with satellite uploading simulation
+            _buildAddressField(controller: _stateCtrl, label: "State", hint: "Maharashtra"),
+            const SizedBox(height: 12),
+            _buildAddressField(controller: _cityCtrl, label: "City", hint: "Mumbai"),
+            const SizedBox(height: 12),
+            _buildAddressField(controller: _areaCtrl, label: "Area / Locality", hint: "Bandra West"),
+            const SizedBox(height: 12),
+            _buildAddressField(controller: _landmarkCtrl, label: "Landmark (Optional)", hint: "Near Carter Road", required: false),
+            const SizedBox(height: 28),
+            // Submit Incident Button
             SizedBox(
               width: double.infinity,
               height: 52,
               child: ElevatedButton(
-                onPressed: _isSubmitting ? null : _submit,
+                onPressed: (canSubmit && !_isSubmitting) ? _submit : null,
                 style: ElevatedButton.styleFrom(
                   backgroundColor: const Color(0xFF34D399),
                   foregroundColor: const Color(0xFF111315),
+                  disabledBackgroundColor: Colors.white10,
+                  disabledForegroundColor: Colors.white24,
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
                   shadowColor: const Color(0xFF34D399).withOpacity(0.3),
                   elevation: 4,
@@ -905,11 +1046,11 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
                       child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF111315)),
                     ),
                     SizedBox(width: 12),
-                    Text("Uploading Satellite Packets...", style: TextStyle(fontWeight: FontWeight.bold)),
+                    Text("Submitting Complaint...", style: TextStyle(fontWeight: FontWeight.bold)),
                   ],
                 )
                     : const Text(
-                  "Transmit Incident Report",
+                  "Submit Complaint",
                   style: TextStyle(fontWeight: FontWeight.w800, fontSize: 15),
                 ),
               ),
@@ -920,112 +1061,45 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
       ),
     );
   }
-  Widget _buildAdditionalReportSettings() {
-    final List<String> urgencies = ['Low', 'Medium', 'High', 'Very High'];
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        const Text(
-          "Incident Urgency Priority",
-          style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.white38),
+  Widget _buildAddressField({
+    required TextEditingController controller,
+    required String label,
+    required String hint,
+    bool required = true,
+  }) {
+    return TextFormField(
+      controller: controller,
+      style: const TextStyle(color: Colors.white, fontSize: 13),
+      validator: required
+          ? (v) {
+        if (v == null || v.isEmpty) return '$label is required';
+        return null;
+      }
+          : null,
+      decoration: InputDecoration(
+        labelText: label,
+        labelStyle: const TextStyle(color: Colors.white54, fontSize: 12),
+        hintText: hint,
+        hintStyle: const TextStyle(color: Colors.white24, fontSize: 12),
+        filled: true,
+        fillColor: const Color(0xFF1B1D22),
+        contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(14),
+          borderSide: const BorderSide(color: Colors.white10),
         ),
-        const SizedBox(height: 6),
-        Container(
-          padding: const EdgeInsets.all(4),
-          decoration: BoxDecoration(
-            color: const Color(0xFF1B1D22),
-            borderRadius: BorderRadius.circular(14),
-            border: Border.all(color: Colors.white.withOpacity(0.04)),
-          ),
-          child: Row(
-            children: urgencies.map((u) {
-              final bool isSel = _urgencyLevel == u;
-              Color urgentColor = const Color(0xFFFFC72C);
-              if (u == 'High') urgentColor = const Color(0xFFF4B400);
-              if (u == 'Very High') urgentColor = const Color(0xFFEF4444);
-              if (u == 'Low') urgentColor = const Color(0xFF34D399);
-              return Expanded(
-                child: GestureDetector(
-                  onTap: () => setState(() => _urgencyLevel = u),
-                  child: AnimatedContainer(
-                    duration: const Duration(milliseconds: 200),
-                    padding: const EdgeInsets.symmetric(vertical: 8),
-                    decoration: BoxDecoration(
-                      color: isSel ? urgentColor.withOpacity(0.12) : Colors.transparent,
-                      borderRadius: BorderRadius.circular(10),
-                      border: Border.all(color: isSel ? urgentColor.withOpacity(0.3) : Colors.transparent),
-                    ),
-                    child: Center(
-                      child: Text(
-                        u,
-                        style: TextStyle(
-                          fontSize: 11,
-                          fontWeight: FontWeight.bold,
-                          color: isSel ? urgentColor : Colors.white54,
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              );
-            }).toList(),
-          ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(14),
+          borderSide: const BorderSide(color: Color(0xFFFFC72C), width: 1.2),
         ),
-        const SizedBox(height: 10),
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            const Text(
-              "Report Anonymously",
-              style: TextStyle(color: Colors.white70, fontSize: 13, fontWeight: FontWeight.w500),
-            ),
-            Switch(
-              value: _anonymousReporting,
-              activeColor: const Color(0xFFFFC72C),
-              activeTrackColor: const Color(0xFFFFC72C).withOpacity(0.3),
-              inactiveThumbColor: Colors.grey,
-              inactiveTrackColor: Colors.white10,
-              onChanged: (v) {
-                setState(() {
-                  _anonymousReporting = v;
-                });
-              },
-            ),
-          ],
+        errorBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(14),
+          borderSide: const BorderSide(color: Color(0xFFEF4444), width: 1),
         ),
-      ],
-    );
-  }
-  Widget _buildAiIncidentSummaryCard() {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: const Color(0xFF1B1D22).withOpacity(0.6),
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: Colors.white.withOpacity(0.06)),
-      ),
-      child: Column(
-        children: [
-          _summaryRow("Report Type", _category ?? "Industrial emission"),
-          _summaryRow("Location Zone", "Mumbai Region 18A"),
-          _summaryRow("Verifying Source", _anonymousReporting ? "Anonymous Cryptography" : widget.citizenName),
-          _summaryRow("Severity Priority", _urgencyLevel),
-          _summaryRow("Response Agency", "Muncipal Pollution Control Hub"),
-          _summaryRow("Predicted Resolution Priority", "Immediate (Level 2 Actionable)"),
-          _summaryRow("Estimated Response Time", "5 Minutes Dispatch Plan"),
-        ],
-      ),
-    );
-  }
-  Widget _summaryRow(String label, String val) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4.0),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Text(label, style: const TextStyle(color: Colors.white38, fontSize: 11)),
-          Text(val, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11)),
-        ],
+        focusedErrorBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(14),
+          borderSide: const BorderSide(color: Color(0xFFEF4444), width: 1.2),
+        ),
       ),
     );
   }
@@ -1043,7 +1117,6 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
         mainAxisAlignment: MainAxisAlignment.center,
         mainAxisSize: MainAxisSize.min,
         children: [
-          // Celebrate checkmark
           Container(
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
@@ -1059,14 +1132,15 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
           ),
           const SizedBox(height: 24),
           const Text(
-            'Incident Transmitted',
-            style: TextStyle(fontSize: 22, fontWeight: FontWeight.w900, color: Colors.white),
-          ),
-          const SizedBox(height: 8),
-          const Text(
-            'Satellite telemetry packets received at regional municipal control hub.',
+            'Complaint Registered Successfully',
             textAlign: TextAlign.center,
-            style: TextStyle(color: Colors.white54, fontSize: 13, height: 1.4),
+            style: TextStyle(fontSize: 20, fontWeight: FontWeight.w900, color: Colors.white),
+          ),
+          const SizedBox(height: 10),
+          const Text(
+            'Your complaint has been forwarded to the nearest municipal authority.',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: Colors.white54, fontSize: 13, height: 1.45),
           ),
           const SizedBox(height: 24),
           Container(
@@ -1079,7 +1153,6 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
               children: [
                 _summaryRow("Tracking ID", "AP-2026-00482"),
                 _summaryRow("Status Flag", "Under Verification Review"),
-                _summaryRow("Estimated Verification", "Under 5 Minutes"),
               ],
             ),
           ),
@@ -1091,14 +1164,16 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
                   height: 48,
                   child: ElevatedButton(
                     onPressed: () {
-                      Navigator.pop(context);
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('Redirecting to complaint tracking screen...')),
+                      );
                     },
                     style: ElevatedButton.styleFrom(
                       backgroundColor: const Color(0xFFFFC72C),
                       foregroundColor: const Color(0xFF111315),
                       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                     ),
-                    child: const Text('Return Home', style: TextStyle(fontWeight: FontWeight.bold)),
+                    child: const Text('Track Complaint', style: TextStyle(fontWeight: FontWeight.bold)),
                   ),
                 ),
               ),
@@ -1108,16 +1183,14 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
                   height: 48,
                   child: OutlinedButton(
                     onPressed: () {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(content: Text('Report details shared with community channels.')),
-                      );
+                      Navigator.pop(context);
                     },
                     style: OutlinedButton.styleFrom(
                       foregroundColor: Colors.white,
                       side: const BorderSide(color: Colors.white24),
                       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                     ),
-                    child: const Text('Share Report', style: TextStyle(fontWeight: FontWeight.bold)),
+                    child: const Text('Back to Home', style: TextStyle(fontWeight: FontWeight.bold)),
                   ),
                 ),
               ),
@@ -1127,30 +1200,15 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> with TickerProvid
       ),
     );
   }
-  Widget _buildLocationInputField({
-    required TextEditingController controller,
-    required String label,
-    required String hint,
-  }) {
-    return TextFormField(
-      controller: controller,
-      style: const TextStyle(color: Colors.white, fontSize: 12),
-      decoration: InputDecoration(
-        labelText: label,
-        labelStyle: const TextStyle(color: Colors.white54, fontSize: 11),
-        hintText: hint,
-        hintStyle: const TextStyle(color: Colors.white24, fontSize: 11),
-        filled: true,
-        fillColor: const Color(0xFF111315),
-        contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-        enabledBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(14),
-          borderSide: const BorderSide(color: Colors.white10),
-        ),
-        focusedBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(14),
-          borderSide: const BorderSide(color: Color(0xFFFFC72C), width: 1.5),
-        ),
+  Widget _summaryRow(String label, String val) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4.0),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(label, style: const TextStyle(color: Colors.white38, fontSize: 11)),
+          Text(val, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11)),
+        ],
       ),
     );
   }
@@ -1235,7 +1293,6 @@ class _AiMeshPainter extends CustomPainter {
       ..color = const Color(0xFFFFC72C).withOpacity(0.1)
       ..strokeWidth = 1.0
       ..style = PaintingStyle.stroke;
-    // Draw Corner Targeting brackets
     const double padding = 30.0;
     final double rW = size.width - padding * 2;
     final double rH = size.height - padding * 2;
@@ -1251,18 +1308,10 @@ class _AiMeshPainter extends CustomPainter {
     // BR Corner
     canvas.drawLine(Offset(padding + rW, padding + rH), Offset(padding + rW - 20, padding + rH), paint);
     canvas.drawLine(Offset(padding + rW, padding + rH), Offset(padding + rW, padding + rH - 20), paint);
-    // Draw bounding boxes around simulated center objects
     if (progress > 0.4) {
       paint.color = const Color(0xFFEF4444).withOpacity(0.35);
       canvas.drawRect(
         Rect.fromCenter(center: Offset(size.width * 0.5, size.height * 0.45), width: 140, height: 100),
-        paint,
-      );
-      // Label indicator
-      paint.style = PaintingStyle.fill;
-      paint.color = const Color(0xFFEF4444).withOpacity(0.7);
-      canvas.drawRect(
-        Rect.fromLTWH(size.width * 0.5 - 70, size.height * 0.45 - 65, 95, 15),
         paint,
       );
     }

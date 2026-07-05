@@ -1,14 +1,14 @@
 import 'package:flutter/material.dart';
 
-class WorkerDashboard extends StatelessWidget {
-  const WorkerDashboard({super.key});
+class AdminDashboard extends StatelessWidget {
+  const AdminDashboard({super.key});
 
   @override
   Widget build(BuildContext context) {
     return const Scaffold(
       body: Center(
         child: Text(
-          'Worker Dashboard',
+          'Admin Dashboard',
           style: TextStyle(fontSize: 24),
         ),
       ),
